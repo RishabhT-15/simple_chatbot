@@ -6,6 +6,8 @@ from groq import Groq
 # Load environment variables from .env file
 load_dotenv()
 
+#Trigering Redployment
+
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 if not GROQ_API_KEY:
     raise EnvironmentError("GROQ_API_KEY not found in the environment. Please set it in your .env file")
