@@ -5,3 +5,5 @@ langchain
 requests
 python-multipart
 torch
+pysqlite3-binary
+
