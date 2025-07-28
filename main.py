@@ -1,3 +1,8 @@
+import sys
+import importlib
+
+importlib.import_module("pysqlite3")
+sys.modules["sqlite3"] = sys.modules["pysqlite3"]
 import os
 import shutil
 import tempfile
@@ -11,11 +16,6 @@ import streamlit as st
 import requests
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import re
-import sys
-import importlib
-
-importlib.import_module("pysqlite3")
-sys.modules["sqlite3"] = sys.modules["pysqlite3"]
 
 
 # -------------- Configuration --------------
