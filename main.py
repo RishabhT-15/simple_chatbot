@@ -1,349 +1,274 @@
 import os
-from flask import Flask, render_template_string, request, jsonify
-from dotenv import load_dotenv
-from groq import Groq
+import shutil
+import tempfile
+import zipfile
+import re
+import chromadb
+import torch
+from chromadb import PersistentClient
+from sentence_transformers import SentenceTransformer
+import streamlit as st
+import requests
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import re
 
-# Load environment variables from .env file
-load_dotenv()
+# -------------- Configuration --------------
 
-#Trigering Redployment
+# Groq API config - replace with your actual Groq API key or keep hardcoded as you prefer
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]  # Secure in prod
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')
-if not GROQ_API_KEY:
-    raise EnvironmentError("GROQ_API_KEY not found in the environment. Please set it in your .env file")
+# Session state for per-user repo embeddings
+if "user_id" not in st.session_state:
+    st.session_state["user_id"] = "user_" + next(tempfile._get_candidate_names())
 
-# Initialize the Groq client
-client = Groq(api_key=GROQ_API_KEY)
+BASE_PERSIST_DIR = "./chroma_db"
+os.makedirs(BASE_PERSIST_DIR, exist_ok=True)
 
-app = Flask(__name__)
-
-# HTML template with inline CSS and JS for chatbot UI (including markdown renderer and code styling)
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Simple Chatbot</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter&family=Material+Icons" rel="stylesheet" />
-  <style>
-    /* Reset and base */
-    * {
-      box-sizing: border-box;
-    }
-    body {
-      margin: 0;
-      font-family: 'Inter', sans-serif;
-      background: linear-gradient(135deg, #1e293b, #0f172a);
-      color: #e0e7ff;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
-      padding: 16px;
-    }
-    #app {
-      display: flex;
-      flex-direction: column;
-      max-width: 900px; /* Increased width from 720px */
-      width: 100%;
-      height: 90vh;
-      background: rgba(15, 23, 42, 0.8);
-      border-radius: 16px;
-      backdrop-filter: blur(10px);
-      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
-      overflow: hidden;
-    }
-    header {
-      padding: 16px 24px;
-      border-bottom: 1px solid rgba(255,255,255,0.1);
-      font-size: 1.5rem;
-      font-weight: 700;
-      color: #7dd3fc;
-      text-align: center;
-      user-select: none;
-    }
-    main {
-      flex: 1;
-      overflow-y: auto;
-      padding: 16px 24px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .message {
-      max-width: 85%; /* Increased from 75% */
-      padding: 12px 16px;
-      border-radius: 16px;
-      line-height: 1.4;
-      font-size: 1rem;
-      word-wrap: break-word;
-      display: inline-block;
-      white-space: pre-wrap;
-      user-select: text;
-    }
-    .user-message {
-      align-self: flex-end;
-      background: linear-gradient(135deg, #0284c7, #0369a1);
-      color: white;
-      border-bottom-right-radius: 4px;
-    }
-    .bot-message {
-      align-self: flex-start;
-      background: linear-gradient(135deg, #0ea5e9, #0284c7);
-      color: #f0f9ff;
-      border-bottom-left-radius: 4px;
-      position: relative;
-      /* For code block scroll */
-      overflow-x: auto;
-    }
-    .timestamp {
-      font-size: 0.7rem;
-      opacity: 0.6;
-      margin-top: 4px;
-      user-select: none;
-    }
-    form {
-      display: flex;
-      border-top: 1px solid rgba(255,255,255,0.1);
-      padding: 8px 16px;
-      background: rgba(255,255,255,0.05);
-      backdrop-filter: blur(8px);
-    }
-    input[type="text"] {
-      flex: 1;
-      border: none;
-      background: transparent;
-      padding: 12px;
-      font-size: 1rem;
-      color: #e0e7ff;
-      outline-offset: 4px;
-      border-radius: 12px;
-    }
-    input[type="text"]::placeholder {
-      color: #94a3b8;
-    }
-    button {
-      background: #0284c7;
-      border: none;
-      color: white;
-      font-weight: 700;
-      padding: 0 16px;
-      margin-left: 12px;
-      border-radius: 12px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 1.4rem;
-      transition: background-color 0.3s ease;
-    }
-    button:hover {
-      background: #0369a1;
-    }
-    button:disabled {
-      background: #94a3b8;
-      cursor: default;
-    }
-    /* Scrollbar styling */
-    main::-webkit-scrollbar {
-      width: 8px;
-    }
-    main::-webkit-scrollbar-thumb {
-      background: rgba(66, 153, 225, 0.6);
-      border-radius: 12px;
-    }
-    main::-webkit-scrollbar-track {
-      background: transparent;
-    }
-
-    /* Code blocks styling - no syntax highlight, just plain monospace */
-    pre {
-      background-color: rgba(0,0,0,0.3);
-      padding: 12px;
-      border-radius: 12px;
-      overflow-x: auto;
-      font-family: monospace, Consolas, 'Courier New', monospace;
-      color: inherit; /* No colored syntax highlight */
-      margin: 1em 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    code {
-      background-color: rgba(0,0,0,0.3);
-      padding: 2px 6px;
-      border-radius: 6px;
-      font-family: monospace, Consolas, 'Courier New', monospace;
-      color: inherit;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    /* Styling for bold */
-    strong {
-      font-weight: 700;
-      color: #a5f3fc;
-    }
-    /* Styling for italic */
-    em {
-      font-style: italic;
-      color: #bae6fd;
-    }
-
-    @media (max-width: 640px) {
-      #app {
-        border-radius: 0;
-        height: 100vh;
-      }
-      header {
-        font-size: 1.25rem;
-        padding: 12px;
-      }
-      form {
-        padding: 8px 12px;
-      }
-      input[type="text"] {
-        padding: 10px;
-      }
-      button {
-        padding: 0 12px;
-        font-size: 1.2rem;
-      }
-    }
-  </style>
-  <!-- Load marked.js from CDN for markdown parsing -->
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-</head>
-<body>
-  <div id="app" role="main" aria-label="Chatbot application">
-    <header>Simple Chatbot</header>
-    <main id="chat-window" aria-live="polite" aria-relevant="additions"></main>
-    <form id="chat-form" aria-label="Send message form">
-      <input type="text" id="message-input" autocomplete="off" placeholder="Ask me anything..." aria-label="Message input" required />
-      <button type="submit" aria-label="Send message">
-        <span class="material-icons">send</span>
-      </button>
-    </form>
-  </div>
-  <script>
-    const chatWindow = document.getElementById('chat-window');
-    const chatForm = document.getElementById('chat-form');
-    const messageInput = document.getElementById('message-input');
-
-    // Helper: Format timestamp as HH:mm
-    function formatTime() {
-      const now = new Date();
-      return now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
-    }
-
-    // Escape HTML to safely display user messages as text (avoid injection)
-    function escapeHtml(unsafe) {
-      return unsafe.replace(/[&<>"']/g, function(m) {
-        switch (m) {
-          case '&': return '&amp;';
-          case '<': return '&lt;';
-          case '>': return '&gt;';
-          case '"': return '&quot;';
-          case "'": return '&#039;';
-          default: return m;
-        }
-      });
-    }
-
-    // Add a message bubble to chat
-    // sender: 'user' or 'bot'
-    // For bot messages, render markdown to HTML using marked.js
-    function addMessage(text, sender = 'bot') {
-      const messageDiv = document.createElement('div');
-      messageDiv.className = 'message ' + (sender === 'user' ? 'user-message' : 'bot-message');
-
-      if (sender === 'user') {
-        // Escape user input to prevent HTML render/injection
-        messageDiv.textContent = text;
-      } else {
-        // Render bot response markdown as HTML
-        messageDiv.innerHTML = marked.parse(text);
-      }
-
-      const timestampDiv = document.createElement('div');
-      timestampDiv.className = 'timestamp';
-      timestampDiv.textContent = formatTime();
-
-      messageDiv.appendChild(timestampDiv);
-      chatWindow.appendChild(messageDiv);
-      chatWindow.scrollTop = chatWindow.scrollHeight;
-    }
-
-    // Disable input while waiting
-    function toggleInput(disabled) {
-      messageInput.disabled = disabled;
-      chatForm.querySelector('button').disabled = disabled;
-    }
-
-    chatForm.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const userMessage = messageInput.value.trim();
-      if (!userMessage) return;
-
-      addMessage(userMessage, 'user');
-      toggleInput(true);
-      messageInput.value = '';
-
-      try {
-        const response = await fetch('/chat', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({message: userMessage})
-        });
-        if (!response.ok) throw new Error('Network response was not ok');
-
-        const data = await response.json();
-        addMessage(data.reply, 'bot');
-      } catch (err) {
-        addMessage('Sorry, there was an error processing your request.', 'bot');
-        console.error(err);
-      } finally {
-        toggleInput(false);
-        messageInput.focus();
-      }
-    });
-
-    // Focus input on load
-    window.onload = () => {
-      messageInput.focus();
-    };
-  </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+# Use CPU for sentence-transformers for Mac M1 compatibility
+embedder = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=200)
 
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    data = request.get_json()
-    user_msg = data.get('message', '').strip()
-    if not user_msg:
-        return jsonify(reply="Please send a valid message.")
+# ------------ Helper functions ------------
 
+def clean_collection_name(name: str) -> str:
+    # Clean user_id to match ChromaDB collection naming rules
+    name = re.sub(r'^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$', '', name)
+    name = re.sub(r'[^a-zA-Z0-9._-]', '_', name)
+    name = name[:512]
+    if len(name) < 3:
+        name = name.ljust(3, '0')
+    return name
+
+
+def collect_and_chunk(directory, extensions=('.py', '.java', '.js', '.md')):
+    chunks, metadata = [], []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith(extensions):
+                path = os.path.join(root, file)
+                try:
+                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                        text = f.read()
+                except Exception:
+                    continue
+                for chunk in text_splitter.split_text(text):
+                    chunks.append(chunk)
+                    metadata.append({'source': path})
+    return chunks, metadata
+
+
+def embed_uploaded_repo(zip_bytes, raw_user_id):
+    user_id = clean_collection_name(raw_user_id)
+    user_dir = os.path.join(tempfile.gettempdir(), user_id)
+    if os.path.exists(user_dir):
+        shutil.rmtree(user_dir)
+    os.makedirs(user_dir, exist_ok=True)
+    zip_path = os.path.join(user_dir, "repo.zip")
+    with open(zip_path, "wb") as f:
+        f.write(zip_bytes)
     try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "user", "content": user_msg}
-            ],
-            model="llama-3.1-8b-instant"
-        )
-        reply_text = chat_completion.choices[0].message.content
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(user_dir)
     except Exception as e:
-        print(f"Error calling Groq API: {e}")
-        reply_text = "Sorry, I'm having trouble generating a response right now."
+        raise RuntimeError(f"Invalid or corrupted repo archive: {str(e)}")
 
-    return jsonify(reply=reply_text)
+    chunks, metadata = collect_and_chunk(user_dir)
+    persist_dir = os.path.join(BASE_PERSIST_DIR, user_id)
+    os.makedirs(persist_dir, exist_ok=True)
+
+    chroma_client = PersistentClient(path=persist_dir)
+    try:
+        chroma_client.delete_collection(user_id)
+    except Exception:
+        pass
+
+    collection = chroma_client.create_collection(user_id)
+    if chunks:
+        embeddings = embedder.encode(chunks, show_progress_bar=False)
+        collection.add(
+            embeddings=embeddings.tolist(),
+            documents=chunks,
+            metadatas=metadata,
+            ids=[str(i) for i in range(len(chunks))]
+        )
+    else:
+        raise RuntimeError("No code chunks found in the uploaded repository.")
+    return len(chunks)
 
 
-if __name__ == '__main__':
-    app.run(debug=True)
+def retrieve_context(query, raw_user_id, top_k=3):
+    user_id = clean_collection_name(raw_user_id)
+    persist_dir = os.path.join(BASE_PERSIST_DIR, user_id)
+    chroma_client = PersistentClient(path=persist_dir)
+    try:
+        collection = chroma_client.get_collection(user_id)
+    except Exception as e:
+        raise RuntimeError(f"Collection for user '{user_id}' not found. Please upload repo first. ({str(e)})")
+
+    query_embedding = embedder.encode([query])[0].tolist()
+    results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+    docs = results['documents'][0] if results['documents'] else []
+    return docs
 
 
+def query_groq_api(prompt, max_new_tokens=600):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    # Prepare messages payload with system prompt + user prompt:
+    system_msg = {
+        "role": "system",
+        "content": "You are a professional coding assistant for the Ghost Android post-exploitation framework."
+    }
+    user_msg = {
+        "role": "user",
+        "content": prompt
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [system_msg, user_msg],
+        "max_tokens": max_new_tokens,
+    }
+
+    response = requests.post(GROQ_API_URL, headers=headers, json=payload)
+
+    # Debug info (optional)
+    # print(f"Status code: {response.status_code}")
+    # print(f"Response text: {response.text}")
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Groq API request failed: {response.status_code} {response.text}")
+
+    result = response.json()
+    # Extract the generated content
+    try:
+        return result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected Groq API response structure: {result}")
+
+
+def chat_with_rag(query, user_id):
+    context_docs = retrieve_context(query, user_id)
+    context = "\n".join(context_docs)
+    prompt = (
+        f"Below is a snippet of the Ghost codebase for context:\n"
+        f"{context}\n\n"
+        f"{query}\n"
+        "Provide only the complete Python module code, wrapped exactly as shown:\n"
+        "### START OF YOUR CODE ###\n"
+        "<code here>\n"
+        "### END OF YOUR CODE ###"
+    )
+    output_text = query_groq_api(prompt, max_new_tokens=600)
+
+    start_marker = "### START OF YOUR CODE ###"
+    end_marker = "### END OF YOUR CODE ###"
+    start_idx = output_text.find(start_marker)
+    end_idx = output_text.find(end_marker, start_idx)
+
+    if start_idx != -1 and end_idx != -1:
+        code = output_text[start_idx + len(start_marker):end_idx].strip()
+    else:
+        code = output_text.strip()
+    return code
+
+
+# --------------- Streamlit UI -------------------
+
+st.set_page_config(page_title="RAG Chatbot (Repo-Aware) - Groq API", layout="wide")
+st.markdown(
+    "<h2 style='margin-bottom:1rem'>RAG Chatbot with Repo Upload (Using Groq API)</h2>",
+    unsafe_allow_html=True,
+)
+
+# Sidebar: Repo Upload
+st.sidebar.header("Convert Your Repo")
+repo_file = st.sidebar.file_uploader(
+    "Drop a zipped repo here (Python/Java/JS/MD files supported):",
+    type=["zip"]
+)
+
+if repo_file:
+    st.sidebar.info("Processing repo...")
+    try:
+        num_chunks = embed_uploaded_repo(repo_file.read(), st.session_state["user_id"])
+        st.sidebar.success(f"Repo indexed! {num_chunks} chunks.")
+    except Exception as e:
+        st.sidebar.error(f"Error processing repo: {e}")
+
+st.sidebar.markdown("---")
+st.sidebar.write("Use the chat below to ask code/context questions. The model will use your uploaded repo for context!")
+
+# Main chat area
+st.markdown("#### Chat with LLM (using repo context if uploaded)")
+
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+
+chat_input = st.text_area("Your message:", key="chat_in", height=100)
+
+if st.button("Send", key="send_btn") and chat_input.strip():
+    st.session_state["messages"].append(("User", chat_input))
+    with st.spinner("Generating answer..."):
+        try:
+            result = chat_with_rag(chat_input, st.session_state["user_id"])
+            st.session_state["messages"].append(("Bot", result))
+        except Exception as e:
+            st.session_state["messages"].append(("Bot", f"Error: {e}"))
+    st.rerun()
+
+
+
+#chat history
+
+for role, msg in st.session_state.get("messages", []):
+    color = "#2e4737" if role == "Bot" else "#24325a"
+
+    # Split message into alternating [text, code, text, code ...] components
+    # Matches code blocks of form ``````
+    pattern = re.compile(r"``````", re.DOTALL)
+    last_end = 0
+    blocks = []
+
+    for m in pattern.finditer(msg):
+        if m.start() > last_end:
+            # Text before code block
+            blocks.append(('text', msg[last_end:m.start()]))
+        language = m.group(1)
+        code = m.group(2)
+        blocks.append(('code', code, language))
+        last_end = m.end()
+    if last_end < len(msg):
+        blocks.append(('text', msg[last_end:]))
+
+    # Print the role label only at the top of the first block
+    role_label = f"<b>{role}:</b><br>"
+
+    for i, block in enumerate(blocks):
+        if block[0] == 'text':
+            content = block[1].strip()
+            if content:
+                st.markdown(
+                    f"""
+                    <div style="
+                        margin:1em 0;
+                        padding:1em;
+                        border-radius:8px;
+                        background:{color};
+                        color:#f2f2f2;
+                        overflow-x:auto;
+                        font-size: 1.04em;">
+                        {role_label if i==0 else ""}{content}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        elif block[0] == 'code':
+            code, lang = block[1], block[2] or None
+            st.code(code, language=lang)
+        else:
+            pass  # Should not happen
